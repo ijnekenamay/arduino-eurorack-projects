@@ -13,6 +13,16 @@ A DIY Arduino-powered MIDI to 4x CV/gate interface in 6 HP, with both polyphonic
 [6]: https://www.modulargrid.net/e/joeseggiola-midi-4-1
 [7]: https://www.tindie.com/products/joeseggiola/midi-41-a-4x-cvgate-interface-pcb-panel/
 
+### Update (April 22, 2026)
+
+**Refactored & fixed:**
+* `GATE_RETRIG_MS` 40 ms → 5 ms (fits fast ratchet / glitch patterns)
+* `loop()` drains ALL pending MIDI messages per iteration
+* Retrig state machine: NoteOn during gate-LOW gap is queued, not lost
+* `velocity=0` NoteOn treated as NoteOff (MIDI spec §1.4)
+* Support for CC#120 / CC#123 All Notes Off (MIDI Panic)
+* Support for CC#64 Sustain Pedal
+
 Features and limitations
 ------------------------
 
