@@ -9,6 +9,11 @@
 //   4. velocity=0 NoteOn treated as NoteOff (MIDI spec §1.4)
 //   5. CC#120 / CC#123  All Notes Off  (MIDI Panic)
 //   6. CC#64  Sustain Pedal
+//   7. GATE_MIN_HIGH_MS: minimum gate HIGH duration to handle extremely short notes
+//   8. getMidiNoteCV: integer fixed-point math replaces float (more precise, faster)
+//   9. DAC caching: I2C write only when CV values actually change
+//  10. Poly NoteOff: voiceRetrigState now reset to prevent ghost gate pulse
+//  11. Mono NoteOff: outputFlag not raised when only voicePendingOff is set
 // =============================================================================
 
 // =============================================================================
@@ -41,6 +46,7 @@ const byte NOTE_ON_LED   = 13;              // Blinks on every incoming NoteOn
 //     For sluggish envelopes raise to 10–15 ms.
 //
 const unsigned int GATE_RETRIG_MS   = 5;    // [ms]  gate LOW gap for re-trigger
+const unsigned int GATE_MIN_HIGH_MS = 5;    // [ms]  minimum gate HIGH duration
 const bool         GATE_RETRIG_MONO = false; // true → retrig even on legato mono
 
 // --- Pitch / Split -----------------------------------------------------------
@@ -108,8 +114,9 @@ enum Mode : byte {
 #define CALIBRATION_RGB     0x3333CCUL
 
 // CV math
-#define MIDI_NOTE_TO_CV_FACTOR 83.333333f   // 1000 mV / 12 semitones
-#define MIDI_PITCHBEND_MAX     8191
+// 1 V/octave: 1000 mV / 12 semitones = 83.333... mV per semitone.
+// Use integer fixed-point: (noteOffset * 1000 + 6) / 12  (rounding, not truncating).
+#define MIDI_PITCHBEND_MAX 8191
 
 // EEPROM layout
 const int EEPROM_MODE    = 0;
@@ -168,11 +175,32 @@ enum RetrigState : byte { RETRIG_IDLE, RETRIG_LOW };
 RetrigState    voiceRetrigState[N];
 unsigned long  voiceRetrigTime[N];   // millis() when the LOW gap started
 byte           voicePendingNote[N];  // Note queued during RETRIG_LOW (0xFF=none)
+unsigned long  voiceOnTime[N];       // millis() when the gate last went HIGH
+bool           voicePendingOff[N];   // NoteOff arrived too early; pending duration
 
 // ---------------------------------------------------------------------------
 
 int            pitchBend  = 0;
 bool           outputFlag = false;
+
+unsigned int   lastDacValues[N] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
+
+// Opt-1: single millis() call per loop frame, shared by all handlers
+unsigned long  nowMs = 0;
+
+// Opt-2: pre-computed CV lookup table (128 entries × 2 bytes = 256 bytes SRAM)
+uint16_t       cvTable[128];
+
+// Opt-3: gate pin output cache — skip digitalWrite if state hasn't changed
+bool           lastGateState[N]  = {};
+bool           lastOrGateState   = false;
+
+// Opt-4: mode flags cached at setMode() time — avoids repeated comparisons
+bool           modeHasSplit   = false;  // true when MODE_POLY_MONO or MODE_MONO_POLY
+bool           modeIsFullMono = false;  // true when MODE_MONO
+
+// Opt-5: calibration DAC update timer (replaces broken millis() % 50 idiom)
+unsigned long  lastCalibrationUpdate = 0;
 
 // Clock
 unsigned int   clockCount        = 0;
@@ -272,6 +300,10 @@ void setup() {
         MCP4728::GAIN::X2, MCP4728::GAIN::X2,
         MCP4728::GAIN::X2, MCP4728::GAIN::X2);
 
+    // Opt-2: build the note→CV lookup table once at startup.
+    // This avoids a 32-bit division on every output() call.
+    buildCvTable();
+
     int calAddr = EEPROM_DAC_CAL;
     for (byte i = 0; i < 4; i++) {
         calibration[i].init(4000);
@@ -288,6 +320,11 @@ void setup() {
 
 void loop() {
 
+    // Opt-1: capture a single timestamp for the entire frame.
+    // All state machines and handlers share this value — avoids drift
+    // between multiple millis() calls within the same loop iteration.
+    nowMs = millis();
+
     // Drain ALL buffered MIDI messages before anything else.
     // A single MIDI.read() per loop() iteration is not enough for
     // rapid-fire ratchet / glitch patterns — messages pile up in the
@@ -300,9 +337,15 @@ void loop() {
         loopMain();
     }
 
-    gateOrLed.loop();
-    noteOnLed.loop();
-    for (byte i = 0; i < N; i++) gateLed[i].loop();
+    // Opt-6: LED updates only need ~1 ms resolution; running them every CPU
+    // frame (~50 µs) wastes cycles without any visible benefit.
+    static unsigned long lastLedUpdate = 0;
+    if (nowMs != lastLedUpdate) {
+        lastLedUpdate = nowMs;
+        gateOrLed.loop();
+        noteOnLed.loop();
+        for (byte i = 0; i < N; i++) gateLed[i].loop();
+    }
 }
 
 // =============================================================================
@@ -320,6 +363,8 @@ void setupMain() {
         voiceRetrigState[i] = RETRIG_IDLE;
         voiceRetrigTime[i]  = 0;
         voicePendingNote[i] = 0xFF;
+        voiceOnTime[i]      = 0;
+        voicePendingOff[i]  = false;
     }
 
     bootAnimation();
@@ -363,7 +408,9 @@ void setupCalibration() {
 
 void loopMain() {
 
-    unsigned long now = millis();
+    // Opt-1: use the frame timestamp captured once at the top of loop().
+    // Avoids repeated millis() calls and keeps timing consistent.
+    unsigned long now = nowMs;
 
     // -------------------------------------------------------------------------
     // Retrig state machine
@@ -381,7 +428,17 @@ void loopMain() {
                     voicePendingNote[i] = 0xFF;
                 }
                 voiceRetrigState[i] = RETRIG_IDLE;
+                voiceOnTime[i]      = now; // Gate goes HIGH now
                 outputFlag = true;
+            }
+        }
+
+        // Apply pending NoteOff once minimum HIGH duration has passed
+        if (voicePendingOff[i]) {
+            if (now - voiceOnTime[i] >= GATE_MIN_HIGH_MS) {
+                voiceActive[i]     = false;
+                voicePendingOff[i] = false;
+                outputFlag         = true;
             }
         }
     }
@@ -435,7 +492,11 @@ void loopCalibration() {
 
     for (byte i = 0; i < N; i++) gateLed[i].set(i == calibratingVoice);
 
-    if (millis() % 50 == 0) {
+    // Opt-5: replace the broken `millis() % 50 == 0` idiom.
+    // The modulo check fires continuously for a full millisecond when the
+    // loop is fast, and silently skips 50 ms boundaries when it is slow.
+    if (nowMs - lastCalibrationUpdate >= 50) {
+        lastCalibrationUpdate = nowMs;
         unsigned int sz    = calibration[calibratingVoice].size();
         unsigned int step  = calibration[calibratingVoice].getStep();
         unsigned int value = step * (calibratingInterval + 1);
@@ -474,6 +535,10 @@ void setMode(byte m) {
         default:
             break;
     }
+    // Opt-4: pre-compute per-mode flags used in isNoteForMonophony().
+    // Eliminates three mode comparisons per NoteOn/Off/output call.
+    modeHasSplit   = (mode == MODE_POLY_MONO || mode == MODE_MONO_POLY);
+    modeIsFullMono = (mode == MODE_MONO);
     EEPROM.update(EEPROM_MODE, mode);
     setModeLed();
     reset();
@@ -498,7 +563,7 @@ void voicesLock() {
             }
             if (DEBUG) debugVoices();
         }
-        voiceLockLedTime = millis();
+        voiceLockLedTime = nowMs;
         if (MODE_LEDS_PWM) {
             SoftPWMSet(MODE_LEDS[0], 0);
             SoftPWMSet(MODE_LEDS[1], 0);
@@ -518,12 +583,20 @@ void reset() {
         voiceRetrigState[i] = RETRIG_IDLE;
         voiceRetrigTime[i]  = 0;
         voicePendingNote[i] = 0xFF;
+        voiceOnTime[i]      = 0;
+        voicePendingOff[i]  = false;
         mono[i].clear();
+        // Opt-3: invalidate gate cache so output() re-drives all gate pins
+        lastGateState[i]   = false;
     }
     digitalWrite(GATE_OR, LOW);
     gateOrLed.off();
+    lastOrGateState = false;  // Opt-3
     poly.clear();
     pitchBend  = 0;
+    // Force DAC refresh on next output() call — mode change may have altered
+    // which voices are active; stale cache would suppress the I2C update.
+    for (byte i = 0; i < N; i++) lastDacValues[i] = 0xFFFF;
     outputFlag = true;
 }
 
@@ -535,6 +608,7 @@ void allNotesOff() {
         voiceRetrigState[i] = RETRIG_IDLE;
         voiceRetrigTime[i]  = 0;
         voicePendingNote[i] = 0xFF;
+        voicePendingOff[i]  = false;
     }
     poly.clear();
     outputFlag = true;
@@ -546,32 +620,16 @@ void allNotesOff() {
 
 void output() {
 
-    // CV (DAC)
-    unsigned int dacValues[4];
-    for (byte i = 0; i < 4; i++) {
-        if (i < N) {
-            int pb = pitchBend;
-            // In split modes, pitch-bend applies to the mono voice only
-            if ((mode == MODE_POLY_MONO || mode == MODE_MONO_POLY) &&
-                !isNoteForMonophony(voiceMidiNote[i])) {
-                pb = 0;
-            }
-            dacValues[i] = getMidiNoteCV(voiceMidiNote[i], pb);
-        } else {
-            dacValues[i] = 0;
-        }
-    }
-    dac.analogWrite(
-        calibration[0].map(dacValues[0]),
-        calibration[1].map(dacValues[1]),
-        calibration[2].map(dacValues[2]),
-        calibration[3].map(dacValues[3])
-    );
-
-    // Gate pins — LOW while a retrig gap is in progress
+    // Opt-7: Update Gate pins FIRST.
+    // GPIO toggles are nearly instantaneous compared to I2C (~2000 cycles).
+    // By doing this first, we minimize the jitter between MIDI event and Gate rise.
     for (byte i = 0; i < N; i++) {
         bool gateHigh = voiceActive[i] && (voiceRetrigState[i] == RETRIG_IDLE);
-        digitalWrite(GATES[i], gateHigh ? HIGH : LOW);
+        // Opt-3: Skip digitalWrite if the state hasn't changed.
+        if (gateHigh != lastGateState[i]) {
+            digitalWrite(GATES[i], gateHigh ? HIGH : LOW);
+            lastGateState[i] = gateHigh;
+        }
         gateLed[i].set(gateHigh);
     }
 
@@ -580,9 +638,38 @@ void output() {
         bool orHigh = false;
         byte first  = (mode == MODE_MONO_POLY) ? 1 : 0;
         byte last   = (mode == MODE_POLY_MONO) ? N - 2 : N - 1;
-        for (byte i = first; i <= last; i++) orHigh |= (voiceActive[i] && voiceRetrigState[i] == RETRIG_IDLE);
-        digitalWrite(GATE_OR, orHigh ? HIGH : LOW);
+        for (byte i = first; i <= last; i++) {
+            orHigh |= (voiceActive[i] && voiceRetrigState[i] == RETRIG_IDLE);
+        }
+        if (orHigh != lastOrGateState) {
+            digitalWrite(GATE_OR, orHigh ? HIGH : LOW);
+            lastOrGateState = orHigh;
+        }
         gateOrLed.set(orHigh);
+    }
+
+    // CV (DAC)
+    unsigned int dacValues[4];
+    bool dacChanged = false;
+
+    for (byte i = 0; i < 4; i++) {
+        if (i < N) {
+            int pb = pitchBend;
+            // Opt-4: Use cached flags instead of re-evaluating mode conditions
+            if (modeHasSplit && !isNoteForMonophony(voiceMidiNote[i])) {
+                pb = 0;
+            }
+            dacValues[i] = calibration[i].map(getMidiNoteCV(voiceMidiNote[i], pb));
+        } else {
+            dacValues[i] = 0;
+        }
+        if (dacValues[i] != lastDacValues[i]) dacChanged = true;
+    }
+
+    // Only update DAC if at least one value has changed to save I2C bandwidth/CPU
+    if (dacChanged) {
+        dac.analogWrite(dacValues[0], dacValues[1], dacValues[2], dacValues[3]);
+        for (byte i = 0; i < 4; i++) lastDacValues[i] = dacValues[i];
     }
 
     if (DEBUG) debugVoices();
@@ -603,7 +690,7 @@ void startRetrig(byte i, byte pendingNote) {
     digitalWrite(GATES[i], LOW);
     gateLed[i].set(false);
     voiceRetrigState[i] = RETRIG_LOW;
-    voiceRetrigTime[i]  = millis();
+    voiceRetrigTime[i]  = nowMs;  // Opt-1: use shared nowMs
     voicePendingNote[i] = pendingNote;
 }
 
@@ -640,7 +727,7 @@ void handleNoteOn(byte channel, byte note, byte velocity) {
             // consistent with the polyphonic path behaviour.
             voiceMidiNote[vi]    = note;
             voicePendingNote[vi] = note;
-            // Do NOT set outputFlag; gate must stay LOW until the gap ends.
+            outputFlag           = true; // Physically update CV now (CV leads gate)
         } else {
             bool needsRetrig = GATE_RETRIG_MONO && voiceActive[vi];
             voiceMidiNote[vi] = note;   // Update CV immediately
@@ -648,7 +735,9 @@ void handleNoteOn(byte channel, byte note, byte velocity) {
             if (needsRetrig) {
                 startRetrig(vi, 0xFF);  // Note already written; open gap only
             } else {
-                outputFlag = true;
+                voiceOnTime[vi]    = nowMs;
+                voicePendingOff[vi] = false;
+                outputFlag         = true;
             }
         }
 
@@ -668,7 +757,7 @@ void handleNoteOn(byte channel, byte note, byte velocity) {
             // Pre-write the CV so pitch changes immediately (CV leads gate).
             voiceMidiNote[i]    = note;
             voicePendingNote[i] = note;
-            // Gate stays LOW; loopMain will raise it after the gap.
+            outputFlag          = true; // Physically update CV now (CV leads gate)
         } else {
             bool needsRetrig = voiceActive[i] && (voiceMidiNote[i] != note);
             voiceMidiNote[i]  = note;   // Update CV
@@ -676,7 +765,9 @@ void handleNoteOn(byte channel, byte note, byte velocity) {
             if (needsRetrig) {
                 startRetrig(i, 0xFF);
             } else {
-                outputFlag = true;
+                voiceOnTime[i]    = nowMs;
+                voicePendingOff[i] = false;
+                outputFlag        = true;
             }
         }
     }
@@ -700,7 +791,8 @@ void handleNoteOff(byte channel, byte note, byte velocity) {
             // A previously held note resurfaces — glide or retrig to it
             if (voiceRetrigState[vi] == RETRIG_LOW) {
                 voicePendingNote[vi] = (byte)newNote;
-                voiceMidiNote[vi]    = (byte)newNote;   // CV leads gate
+                voiceMidiNote[vi]    = (byte)newNote;
+                outputFlag           = true; // Physically update CV now (CV leads gate)
             } else {
                 bool needsRetrig = GATE_RETRIG_MONO &&
                                    voiceActive[vi] &&
@@ -710,6 +802,8 @@ void handleNoteOff(byte channel, byte note, byte velocity) {
                 if (needsRetrig) {
                     startRetrig(vi, 0xFF);
                 } else {
+                    voiceOnTime[vi]    = nowMs;
+                    voicePendingOff[vi] = false;
                     outputFlag = true;
                 }
             }
@@ -717,10 +811,16 @@ void handleNoteOff(byte channel, byte note, byte velocity) {
             // Stack empty — close the gate and cancel any retrig in progress.
             // If we leave voicePendingNote set, loopMain would resurrect the
             // note when the gap expires (ghost note bug).
-            voiceActive[vi]      = false;
             voiceRetrigState[vi] = RETRIG_IDLE;
             voicePendingNote[vi] = 0xFF;
-            outputFlag           = true;
+            if (nowMs - voiceOnTime[vi] < GATE_MIN_HIGH_MS) {
+                // Gate and CV are unchanged; no need to call output().
+                // loopMain will lower the gate after the minimum HIGH duration expires.
+                voicePendingOff[vi] = true;
+            } else {
+                voiceActive[vi] = false;
+                outputFlag      = true;
+            }
         }
 
     // -------------------------------------------------------------------------
@@ -733,9 +833,17 @@ void handleNoteOff(byte channel, byte note, byte velocity) {
 
         byte i = getPolyphonyVoiceIndex(voice);
         if (!voiceLocked[i]) {
-            voiceActive[i]      = false;
-            voicePendingNote[i] = 0xFF;  // Cancel any queued note; prevents ghost
-            outputFlag          = true;  // note if NoteOff arrives during retrig gap
+            // Cancel any in-progress retrig gap to prevent a ghost gate pulse.
+            // Without this, a RETRIG_LOW gap that times out after NoteOff
+            // would briefly raise the gate HIGH before voicePendingOff lowers it.
+            voiceRetrigState[i] = RETRIG_IDLE;
+            voicePendingNote[i] = 0xFF;  // Cancel any queued note (ghost-note guard)
+            if (nowMs - voiceOnTime[i] < GATE_MIN_HIGH_MS) {
+                voicePendingOff[i] = true;
+            } else {
+                voiceActive[i] = false;
+            }
+            outputFlag = true;
         }
     }
 }
@@ -783,7 +891,7 @@ void handleClock() {
     if (clockCount == 0) {
         digitalWrite(GATE_OR, HIGH);
         clockTrig     = true;
-        clockTrigTime = millis();
+        clockTrigTime = nowMs;
         gateOrLed.flash();
     }
     clockCount = (clockCount + 1) % CLOCK_PPQ;
@@ -824,10 +932,12 @@ void handleCalibrationOffset(byte channel, byte note, byte velocity) {
 // =============================================================================
 
 bool isNoteForMonophony(byte note) {
+    // Opt-4: Use cached mode flags to avoid repeated enum comparisons.
+    if (modeIsFullMono) return true;
+    if (!modeHasSplit)  return false;
+
     bool highKey = note >= (SPLIT_MIDI_OCTAVE + 1) * 12;
-    return (mode == MODE_MONO) ||
-           (mode == MODE_POLY_MONO &&  highKey) ||
-           (mode == MODE_MONO_POLY && !highKey);
+    return (mode == MODE_POLY_MONO) ? highKey : !highKey;
 }
 
 byte getMonophonyStackIndex(byte channel) {
@@ -844,13 +954,26 @@ byte getPolyphonyVoiceIndex(byte i) {
     return (mode == MODE_MONO_POLY) ? i + 1 : i;
 }
 
-unsigned int getMidiNoteCV(byte note, int pitchBendValue) {
-    int   lowestNote = (LOWEST_MIDI_OCTAVE + 1) * 12;
-    float noteForCV  = (float)note - lowestNote;
-    if (pitchBendValue != 0) {
-        noteForCV += ((float)pitchBendValue / MIDI_PITCHBEND_MAX) * PITCH_BEND_SEMITONES;
+void buildCvTable() {
+    int lowestNote = (LOWEST_MIDI_OCTAVE + 1) * 12;
+    for (int n = 0; n < 128; n++) {
+        int offset = n - lowestNote;
+        // Accurate integer fixed-point math (Bug 1 fix logic)
+        int32_t cv = ((int32_t)offset * 1000L + 6L) / 12L;
+        cvTable[n] = (uint16_t)constrain(cv, 0, 4000);
     }
-    return (unsigned int)min(4000, max(0, (int)roundf(noteForCV * MIDI_NOTE_TO_CV_FACTOR)));
+}
+
+unsigned int getMidiNoteCV(byte note, int pitchBendValue) {
+    // Opt-2: Fast table lookup replaces 32-bit division for the base note.
+    int32_t cv = cvTable[note & 0x7F];
+
+    if (pitchBendValue != 0) {
+        // Bend calculation still requires division but is only done when needed.
+        cv += ((int32_t)pitchBendValue * PITCH_BEND_SEMITONES * 1000L) / (8191L * 12L);
+    }
+
+    return (unsigned int)constrain(cv, 0, 4000);
 }
 
 String getMidiNoteName(byte note) {
