@@ -188,9 +188,6 @@ unsigned int   lastDacValues[N] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
 // Opt-1: single millis() call per loop frame, shared by all handlers
 unsigned long  nowMs = 0;
 
-// Opt-2: pre-computed CV lookup table (128 entries × 2 bytes = 256 bytes SRAM)
-uint16_t       cvTable[128];
-
 // Opt-3: gate pin output cache — skip digitalWrite if state hasn't changed
 bool           lastGateState[N]  = {};
 bool           lastOrGateState   = false;
@@ -299,10 +296,6 @@ void setup() {
     dac.selectGain(
         MCP4728::GAIN::X2, MCP4728::GAIN::X2,
         MCP4728::GAIN::X2, MCP4728::GAIN::X2);
-
-    // Opt-2: build the note→CV lookup table once at startup.
-    // This avoids a 32-bit division on every output() call.
-    buildCvTable();
 
     int calAddr = EEPROM_DAC_CAL;
     for (byte i = 0; i < 4; i++) {
@@ -954,22 +947,15 @@ byte getPolyphonyVoiceIndex(byte i) {
     return (mode == MODE_MONO_POLY) ? i + 1 : i;
 }
 
-void buildCvTable() {
-    int lowestNote = (LOWEST_MIDI_OCTAVE + 1) * 12;
-    for (int n = 0; n < 128; n++) {
-        int offset = n - lowestNote;
-        // Accurate integer fixed-point math (Bug 1 fix logic)
-        int32_t cv = ((int32_t)offset * 1000L + 6L) / 12L;
-        cvTable[n] = (uint16_t)constrain(cv, 0, 4000);
-    }
-}
-
 unsigned int getMidiNoteCV(byte note, int pitchBendValue) {
-    // Opt-2: Fast table lookup replaces 32-bit division for the base note.
-    int32_t cv = cvTable[note & 0x7F];
+    int lowestNote = (LOWEST_MIDI_OCTAVE + 1) * 12;
+    int noteOffset = (int)note - lowestNote;
+
+    // Fixed-point math (rounding with +6) to ensure pitch accuracy.
+    // Calculations are performed on-the-fly to save SRAM.
+    int32_t cv = ((int32_t)noteOffset * 1000L + 6L) / 12L;
 
     if (pitchBendValue != 0) {
-        // Bend calculation still requires division but is only done when needed.
         cv += ((int32_t)pitchBendValue * PITCH_BEND_SEMITONES * 1000L) / (8191L * 12L);
     }
 
