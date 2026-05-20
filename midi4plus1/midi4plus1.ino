@@ -159,7 +159,9 @@ Mode           mode = MODE_POLY;
 
 byte           voiceMidiNote[N];    // Current MIDI note per voice
 bool           voiceActive[N];      // Gate active flag per voice
-bool           voiceLocked[N];      // Sustain-locked flag per voice
+bool           voiceLocked[N];      // Sustain-locked flag per voice (front panel button)
+bool           voiceHeld[N];        // Physical key held flag per voice
+bool           sustainPedal = false;
 
 // --- Retrig state machine ---------------------------------------------------
 //
@@ -353,6 +355,7 @@ void setupMain() {
         voiceMidiNote[i]    = 12;           // C0
         voiceActive[i]      = false;
         voiceLocked[i]      = false;
+        voiceHeld[i]        = false;
         voiceRetrigState[i] = RETRIG_IDLE;
         voiceRetrigTime[i]  = 0;
         voicePendingNote[i] = 0xFF;
@@ -542,8 +545,12 @@ void voicesLock() {
     for (byte i = 0; i < N; i++) {
         if (voiceLocked[i]) {
             voiceLocked[i] = false;
-            voiceActive[i] = false;
-            outputFlag     = true;
+            if (!voiceHeld[i] && !sustainPedal) {
+                voiceActive[i]      = false;
+                voiceRetrigState[i] = RETRIG_IDLE;
+                voicePendingNote[i] = 0xFF;
+                outputFlag          = true;
+            }
             didUnlock      = true;
         }
     }
@@ -573,6 +580,7 @@ void reset() {
         gateLed[i].off();
         voiceActive[i]      = false;
         voiceLocked[i]      = false;
+        voiceHeld[i]        = false;
         voiceRetrigState[i] = RETRIG_IDLE;
         voiceRetrigTime[i]  = 0;
         voicePendingNote[i] = 0xFF;
@@ -587,9 +595,6 @@ void reset() {
     lastOrGateState = false;  // Opt-3
     poly.clear();
     pitchBend  = 0;
-    // Force DAC refresh on next output() call — mode change may have altered
-    // which voices are active; stale cache would suppress the I2C update.
-    for (byte i = 0; i < N; i++) lastDacValues[i] = 0xFFFF;
     outputFlag = true;
 }
 
@@ -598,12 +603,15 @@ void allNotesOff() {
     for (byte i = 0; i < N; i++) {
         mono[i].clear();
         voiceActive[i]      = false;
+        voiceLocked[i]      = false;
+        voiceHeld[i]        = false;
         voiceRetrigState[i] = RETRIG_IDLE;
         voiceRetrigTime[i]  = 0;
         voicePendingNote[i] = 0xFF;
         voicePendingOff[i]  = false;
     }
     poly.clear();
+    sustainPedal = false;
     outputFlag = true;
 }
 
@@ -720,11 +728,12 @@ void handleNoteOn(byte channel, byte note, byte velocity) {
             // consistent with the polyphonic path behaviour.
             voiceMidiNote[vi]    = note;
             voicePendingNote[vi] = note;
-            outputFlag           = true; // Physically update CV now (CV leads gate)
+            // Do NOT set outputFlag; gate must stay LOW until the gap ends.
         } else {
             bool needsRetrig = GATE_RETRIG_MONO && voiceActive[vi];
             voiceMidiNote[vi] = note;   // Update CV immediately
             voiceActive[vi]   = true;
+            voiceHeld[vi]     = true;
             if (needsRetrig) {
                 startRetrig(vi, 0xFF);  // Note already written; open gap only
             } else {
@@ -744,6 +753,7 @@ void handleNoteOn(byte channel, byte note, byte velocity) {
 
         byte i        = getPolyphonyVoiceIndex(voice);
         voiceLocked[i] = false;
+        voiceHeld[i]   = true;
 
         if (voiceRetrigState[i] == RETRIG_LOW) {
             // Gap running — queue the new note.
@@ -781,6 +791,7 @@ void handleNoteOff(byte channel, byte note, byte velocity) {
         int newNote = mono[si].noteOff(note);
 
         if (newNote > -1) {
+            voiceHeld[vi] = true;
             // A previously held note resurfaces — glide or retrig to it
             if (voiceRetrigState[vi] == RETRIG_LOW) {
                 voicePendingNote[vi] = (byte)newNote;
@@ -801,18 +812,19 @@ void handleNoteOff(byte channel, byte note, byte velocity) {
                 }
             }
         } else {
+            voiceHeld[vi] = false;
             // Stack empty — close the gate and cancel any retrig in progress.
             // If we leave voicePendingNote set, loopMain would resurrect the
             // note when the gap expires (ghost note bug).
-            voiceRetrigState[vi] = RETRIG_IDLE;
-            voicePendingNote[vi] = 0xFF;
-            if (nowMs - voiceOnTime[vi] < GATE_MIN_HIGH_MS) {
-                // Gate and CV are unchanged; no need to call output().
-                // loopMain will lower the gate after the minimum HIGH duration expires.
-                voicePendingOff[vi] = true;
-            } else {
-                voiceActive[vi] = false;
-                outputFlag      = true;
+            if (!voiceLocked[vi] && !sustainPedal) {
+                voiceRetrigState[vi] = RETRIG_IDLE;
+                voicePendingNote[vi] = 0xFF;
+                if (nowMs - voiceOnTime[vi] < GATE_MIN_HIGH_MS) {
+                    voicePendingOff[vi] = true;
+                } else {
+                    voiceActive[vi] = false;
+                    outputFlag      = true;
+                }
             }
         }
 
@@ -825,12 +837,10 @@ void handleNoteOff(byte channel, byte note, byte velocity) {
         if (voice < 0) return;
 
         byte i = getPolyphonyVoiceIndex(voice);
-        if (!voiceLocked[i]) {
-            // Cancel any in-progress retrig gap to prevent a ghost gate pulse.
-            // Without this, a RETRIG_LOW gap that times out after NoteOff
-            // would briefly raise the gate HIGH before voicePendingOff lowers it.
+        voiceHeld[i] = false;
+        if (!voiceLocked[i] && !sustainPedal) {
             voiceRetrigState[i] = RETRIG_IDLE;
-            voicePendingNote[i] = 0xFF;  // Cancel any queued note (ghost-note guard)
+            voicePendingNote[i] = 0xFF;  // Cancel any queued note; prevents ghost
             if (nowMs - voiceOnTime[i] < GATE_MIN_HIGH_MS) {
                 voicePendingOff[i] = true;
             } else {
@@ -857,18 +867,17 @@ void handleControlChange(byte channel, byte number, byte value) {
     }
 
     if (number == 64) {
-        if (value >= 64) {
-            // Pedal down: latch currently active voices
+        bool down = value >= 64;
+        if (down && !sustainPedal) {
+            sustainPedal = true;
+        } else if (!down && sustainPedal) {
+            sustainPedal = false;
             for (byte i = 0; i < N; i++) {
-                if (voiceActive[i]) voiceLocked[i] = true;
-            }
-        } else {
-            // Pedal up: release latched voices
-            for (byte i = 0; i < N; i++) {
-                if (voiceLocked[i]) {
-                    voiceLocked[i] = false;
-                    voiceActive[i] = false;
-                    outputFlag     = true;
+                if (!voiceHeld[i] && !voiceLocked[i]) {
+                    voiceActive[i]      = false;
+                    voiceRetrigState[i] = RETRIG_IDLE;
+                    voicePendingNote[i] = 0xFF;
+                    outputFlag          = true;
                 }
             }
         }
