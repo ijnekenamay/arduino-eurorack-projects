@@ -102,12 +102,19 @@ public:
 
         } else { // Mode::FIRST
 
-            for (byte i = 0; i < this->size; i++) {
-                if (!this->active[i]) {
-                    voice = i;
-                    break;
+            // 1. Already playing this exact note?
+            voice = this->find(note);
+
+            // 2. First inactive voice
+            if (voice == -1) {
+                for (byte i = 0; i < this->size; i++) {
+                    if (!this->active[i]) {
+                        voice = i;
+                        break;
+                    }
                 }
             }
+            
             if (voice == -1) return -1; // All voices busy — new note dropped
         }
 
